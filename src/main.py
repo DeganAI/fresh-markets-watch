@@ -18,7 +18,7 @@ from src.liquidity_tracker import LiquidityTracker
 from src.holder_analyzer import HolderAnalyzer
 from src.factory_config import get_supported_chains, get_chain_name, get_all_factories
 from src.price_feed import get_token_prices
-from src.x402_middleware import X402Middleware
+from src.x402_middleware_dual import X402Middleware
 
 # Configure logging
 logging.basicConfig(
@@ -55,7 +55,10 @@ app.add_middleware(
     X402Middleware,
     payment_address=payment_address,
     base_url=base_url,
-    facilitator_url="https://facilitator.daydreams.systems",
+    facilitator_urls=[
+        "https://facilitator.daydreams.systems",
+        "https://api.cdp.coinbase.com/platform/v2/x402/facilitator"
+    ],
     free_mode=free_mode,
 )
 
