@@ -1,210 +1,186 @@
 """
 x402 Payment Verification Middleware
 
-Verifies USDC payments on Ethereum before serving requests
+Validates payment proofs for x402 micropayment protocol
 """
-from fastapi import Request, HTTPException, status
-from fastapi.responses import JSONResponse
-from web3 import Web3
 import logging
-import os
+import json
+import base64
+import aiohttp
 from typing import Optional
-from datetime import datetime, timedelta
+from fastapi import Request, HTTPException
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
 
 class X402Middleware:
-    """HTTP 402 Payment Required middleware"""
+    """
+    Middleware for x402 payment verification
 
-    # USDC contract on Ethereum
-    USDC_CONTRACT = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-
-    # Minimum payment amount (in USDC, 6 decimals)
-    MIN_PAYMENT_USDC = 0.05  # $0.05 per request
+    Verifies payments via the Daydreams facilitator before allowing access
+    """
 
     def __init__(
         self,
         payment_address: str,
-        ethereum_rpc_url: str,
+        base_url: str,
+        facilitator_url: str = "https://facilitator.daydreams.systems",
         free_mode: bool = False,
     ):
-        """
-        Initialize x402 middleware
-
-        Args:
-            payment_address: Ethereum address to receive payments
-            ethereum_rpc_url: Ethereum RPC endpoint
-            free_mode: If True, skip payment verification (for testing)
-        """
         self.payment_address = payment_address
+        self.base_url = base_url
+        self.facilitator_url = facilitator_url
         self.free_mode = free_mode
 
-        if not free_mode:
-            # Initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(ethereum_rpc_url))
+        logger.info(f"x402 Middleware initialized (FREE_MODE={free_mode}, facilitator={facilitator_url})")
 
-            if not self.w3.is_connected():
-                logger.error("Failed to connect to Ethereum RPC")
-                raise ConnectionError("Cannot connect to Ethereum")
-
-            # USDC contract ABI (minimal - just balanceOf and Transfer event)
-            usdc_abi = [
-                {
-                    "constant": True,
-                    "inputs": [{"name": "_owner", "type": "address"}],
-                    "name": "balanceOf",
-                    "outputs": [{"name": "balance", "type": "uint256"}],
-                    "type": "function",
-                },
-                {
-                    "anonymous": False,
-                    "inputs": [
-                        {"indexed": True, "name": "from", "type": "address"},
-                        {"indexed": True, "name": "to", "type": "address"},
-                        {"indexed": False, "name": "value", "type": "uint256"},
-                    ],
-                    "name": "Transfer",
-                    "type": "event",
-                },
-            ]
-
-            self.usdc_contract = self.w3.eth.contract(
-                address=Web3.to_checksum_address(self.USDC_CONTRACT),
-                abi=usdc_abi,
-            )
-
-            logger.info(f"x402 middleware initialized (payment address: {payment_address})")
-        else:
-            logger.warning("x402 middleware in FREE MODE - no payment verification")
-
-    async def verify_payment(self, request: Request) -> bool:
+    async def verify_payment(
+        self,
+        payment_header: str,
+        resource_url: str,
+        amount_required: str,
+    ) -> tuple[bool, Optional[str]]:
         """
-        Verify payment from request headers
+        Verify payment via facilitator
 
-        Expects header: X-Payment-TxHash with transaction hash
-
-        Args:
-            request: FastAPI request
-
-        Returns:
-            True if payment is valid
-
-        Raises:
-            HTTPException if payment is invalid
+        Returns: (is_valid, error_message)
         """
-        if self.free_mode:
-            logger.debug("Free mode - skipping payment verification")
-            return True
-
-        # Get payment tx hash from header
-        tx_hash = request.headers.get("X-Payment-TxHash")
-
-        if not tx_hash:
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail={
-                    "error": "Payment Required",
-                    "message": "Send USDC payment and include X-Payment-TxHash header",
-                    "payment_address": self.payment_address,
-                    "usdc_contract": self.USDC_CONTRACT,
-                    "min_amount_usdc": self.MIN_PAYMENT_USDC,
-                    "instructions": "Send USDC to payment address, then include transaction hash in X-Payment-TxHash header",
-                },
-            )
-
         try:
-            # Get transaction receipt
-            tx_receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            # Decode X-Payment header
+            try:
+                payment_payload = json.loads(base64.b64decode(payment_header))
+            except Exception as e:
+                return False, f"Invalid payment header format: {str(e)}"
 
-            if not tx_receipt or tx_receipt.get("status") != 1:
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail="Transaction failed or not found",
-                )
+            # Construct verification request
+            verification_request = {
+                "paymentPayload": payment_payload,
+                "paymentRequirements": {
+                    "scheme": "exact",
+                    "network": "base",
+                    "maxAmountRequired": amount_required,
+                    "resource": resource_url,
+                    "description": "x402 micropayment",
+                    "mimeType": "application/json",
+                    "payTo": self.payment_address,
+                    "maxTimeoutSeconds": 30,
+                    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC on Base
+                }
+            }
 
-            # Verify transaction is recent (within last hour)
-            block = self.w3.eth.get_block(tx_receipt["blockNumber"])
-            tx_time = datetime.fromtimestamp(block["timestamp"])
-            if datetime.now() - tx_time > timedelta(hours=1):
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail="Payment transaction too old (must be within 1 hour)",
-                )
+            # Call facilitator /verify endpoint
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.facilitator_url}/verify",
+                    json=verification_request,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Facilitator returned {response.status}: {error_text}")
+                        return False, f"Payment verification failed: {error_text}"
 
-            # Parse logs for USDC Transfer event
-            transfer_found = False
-            payment_amount = 0
+                    result = await response.json()
 
-            for log in tx_receipt["logs"]:
-                # Check if it's from USDC contract
-                if log["address"].lower() != self.USDC_CONTRACT.lower():
-                    continue
+                    if result.get("isValid"):
+                        logger.info(f"Payment verified for payer: {result.get('payer')}")
+                        return True, None
+                    else:
+                        reason = result.get("invalidReason", "Unknown reason")
+                        logger.warning(f"Payment invalid: {reason}")
+                        return False, reason
 
-                try:
-                    # Decode Transfer event
-                    event = self.usdc_contract.events.Transfer().process_log(log)
-
-                    # Check if payment is to our address
-                    if event["args"]["to"].lower() == self.payment_address.lower():
-                        transfer_found = True
-                        payment_amount = event["args"]["value"] / 1e6  # USDC has 6 decimals
-
-                        logger.info(f"Payment verified: {payment_amount} USDC from {tx_hash}")
-                        break
-
-                except Exception as e:
-                    logger.debug(f"Failed to decode log: {e}")
-                    continue
-
-            if not transfer_found:
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail=f"No USDC payment found to {self.payment_address}",
-                )
-
-            # Verify amount is sufficient
-            if payment_amount < self.MIN_PAYMENT_USDC:
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail=f"Payment too small: {payment_amount} USDC (minimum: {self.MIN_PAYMENT_USDC} USDC)",
-                )
-
-            return True
-
-        except HTTPException:
-            raise
+        except aiohttp.ClientError as e:
+            logger.error(f"Facilitator connection error: {str(e)}")
+            return False, f"Payment verification service unavailable: {str(e)}"
         except Exception as e:
-            logger.error(f"Payment verification error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Payment verification failed: {str(e)}",
-            )
+            logger.error(f"Payment verification error: {str(e)}")
+            return False, f"Payment verification error: {str(e)}"
+
+    def create_402_response(self, resource_url: str, description: str) -> JSONResponse:
+        """Create HTTP 402 Payment Required response"""
+        metadata = {
+            "x402Version": 1,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "base",
+                    "maxAmountRequired": "50000",  # 0.05 USDC (6 decimals)
+                    "resource": resource_url,
+                    "description": description,
+                    "mimeType": "application/json",
+                    "payTo": self.payment_address,
+                    "maxTimeoutSeconds": 30,
+                    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC on Base
+                }
+            ]
+        }
+        return JSONResponse(content=metadata, status_code=402)
 
     async def __call__(self, request: Request, call_next):
-        """
-        Middleware entry point
+        """Process request and verify payment if required"""
 
-        Args:
-            request: FastAPI request
-            call_next: Next middleware/route
-
-        Returns:
-            Response from route handler
-        """
-        # Skip payment check for health/info endpoints
-        if request.url.path in ["/health", "/", "/info"]:
+        # Skip payment verification in free mode
+        if self.free_mode:
+            logger.debug("FREE_MODE enabled, skipping payment verification")
             return await call_next(request)
 
-        # Verify payment
-        try:
-            await self.verify_payment(request)
-        except HTTPException as e:
-            return JSONResponse(
-                status_code=e.status_code,
-                content=e.detail,
+        # Skip verification for health check and metadata endpoints
+        skip_paths = ["/health", "/.well-known", "/docs", "/redoc", "/openapi.json", "/"]
+        if any(request.url.path.startswith(path) for path in skip_paths):
+            return await call_next(request)
+
+        # Check for payment endpoints (those that require payment)
+        # These are typically POST endpoints that provide actual functionality
+        requires_payment = (
+            request.method == "POST" and
+            "/entrypoints/" in request.url.path
+        )
+
+        if not requires_payment:
+            # Allow GET requests through (they're for discovery/metadata)
+            return await call_next(request)
+
+        # Check for X-Payment header
+        payment_header = request.headers.get("X-Payment")
+
+        if not payment_header:
+            logger.info(f"Payment required for {request.url.path}, no X-Payment header provided")
+            return self.create_402_response(
+                resource_url=str(request.url),
+                description="Payment required to access this resource"
             )
 
-        # Process request
-        response = await call_next(request)
-        return response
+        # Verify payment via facilitator
+        is_valid, error_message = await self.verify_payment(
+            payment_header=payment_header,
+            resource_url=str(request.url),
+            amount_required="50000"  # 0.05 USDC
+        )
+
+        if not is_valid:
+            logger.warning(f"Payment verification failed: {error_message}")
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "error": "Payment verification failed",
+                    "message": error_message,
+                    "x402Version": 1,
+                    "accepts": [{
+                        "scheme": "exact",
+                        "network": "base",
+                        "maxAmountRequired": "50000",
+                        "resource": str(request.url),
+                        "description": "Payment required to access this resource",
+                        "mimeType": "application/json",
+                        "payTo": self.payment_address,
+                        "maxTimeoutSeconds": 30,
+                        "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    }]
+                }
+            )
+
+        # Payment verified, proceed with request
+        logger.info(f"Payment verified, processing request to {request.url.path}")
+        return await call_next(request)
