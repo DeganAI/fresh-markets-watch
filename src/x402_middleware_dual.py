@@ -160,6 +160,19 @@ class X402Middleware(BaseHTTPMiddleware):
                     "payTo": self.payment_address,
                     "maxTimeoutSeconds": 30,
                     "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC on Base
+                    "outputSchema": {
+                        "input": {
+                            "type": "http",
+                            "method": "POST",
+                            "bodyType": "json",
+                            "bodyFields": {
+                                "chain": {"type": "number", "required": True, "description": "Target blockchain chain ID"},
+                                "factories": {"type": "array", "required": True, "description": "AMM factory contracts to monitor"},
+                                "window_minutes": {"type": "number", "required": True, "description": "Time window to scan in minutes"}
+                            }
+                        },
+                        "output": {"type": "object", "description": "Newly launched token pairs with liquidity and volume"}
+                    }
                 }
             ]
         }
@@ -225,6 +238,19 @@ class X402Middleware(BaseHTTPMiddleware):
                         "payTo": self.payment_address,
                         "maxTimeoutSeconds": 30,
                         "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        "outputSchema": {
+                            "input": {
+                                "type": "http",
+                                "method": "POST",
+                                "bodyType": "json",
+                                "bodyFields": {
+                                    "chain": {"type": "number", "required": True, "description": "Target blockchain chain ID"},
+                                    "factories": {"type": "array", "required": True, "description": "AMM factory contracts to monitor"},
+                                    "window_minutes": {"type": "number", "required": True, "description": "Time window to scan in minutes"}
+                                }
+                            },
+                            "output": {"type": "object", "description": "Newly launched token pairs with liquidity and volume"}
+                        }
                     }]
                 }
             )
